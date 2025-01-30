@@ -537,7 +537,7 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, dir
 	if err := conn.Call(boot.ContMgrRestore, &opt, nil); err != nil {
 		return fmt.Errorf("restoring container %q: %v", cid, err)
 	}
-
+	s.MetricMetadata["restore"] = strconv.FormatBool(true)
 	return nil
 }
 
@@ -1439,6 +1439,7 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts s
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
 		return fmt.Errorf("checkpointing container %q: %w", cid, err)
 	}
+	s.MetricMetadata["checkpoint"] = strconv.FormatBool(true)
 	return nil
 }
 
@@ -1562,6 +1563,24 @@ func (s *Sandbox) IsRunning() bool {
 	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
 	// process is running.
 	return unix.Kill(pid, 0) == nil
+}
+
+// IsCheckpointed returns true if the sandbox was checkpointed.
+func (s *Sandbox) IsCheckpointed() bool {
+	if val, err := strconv.ParseBool(s.MetricMetadata["checkpoint"]); err == nil {
+		return val
+	}
+	log.Warningf("sandbox MetricMetadata has invalid value for checkpoint %q", s.MetricMetadata["checkpoint"])
+	return false
+}
+
+// IsRestored returns true if the sandbox was restored.
+func (s *Sandbox) IsRestored() bool {
+	if val, err := strconv.ParseBool(s.MetricMetadata["restore"]); err == nil {
+		return val
+	}
+	log.Warningf("sandbox MetricMetadata has invalid value for restore %q", s.MetricMetadata["restore"])
+	return false
 }
 
 // Stacks collects and returns all stacks for the sandbox.

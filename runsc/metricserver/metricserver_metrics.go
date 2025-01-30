@@ -66,6 +66,16 @@ var (
 		Type: prometheus.TypeCounter,
 		Help: "Counter of sandboxes that have ever been started.",
 	}
+	NumCheckpointedSandboxesMetric = prometheus.Metric{
+		Name: "num_sandboxes_checkpointed",
+		Type: prometheus.TypeCounter,
+		Help: "Counter of sandboxes that have been checkpointed.",
+	}
+	NumRestoredSandboxesMetric = prometheus.Metric{
+		Name: "num_sandboxes_restored",
+		Type: prometheus.TypeCounter,
+		Help: "Counter of sandboxes that have been restored.",
+	}
 )
 
 // Metrics is a list of metrics that the metric server generates.
@@ -79,5 +89,7 @@ var Metrics = []*prometheus.Metric{
 	&NumRunningSandboxesMetric,
 	&NumCannotExportSandboxesMetric,
 	&NumTotalSandboxesMetric,
+	&NumCheckpointedSandboxesMetric,
+	&NumRestoredSandboxesMetric,
 	&prometheus.ProcessStartTimeSeconds,
 }

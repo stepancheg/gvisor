@@ -528,6 +528,8 @@ var MetricMetadataKeys = []string{
 	"cpuarch",
 	"go",
 	"experiment",
+	"checkpoint",
+	"restore",
 }
 
 // MetricMetadata returns key-value pairs that are useful to include in metrics
@@ -551,6 +553,10 @@ func (c *Config) MetricMetadata() map[string]string {
 		// The "experiment" label is currently unused, but may be used to contain
 		// extra information about e.g. an experiment that may be enabled.
 		"experiment": "",
+		// checkpoint indicates if the sandbox has been checkpointed.
+		"checkpoint": "false",
+		// restore indicates if the sandbox has been restored.
+		"restore": "false",
 	}
 }
 
