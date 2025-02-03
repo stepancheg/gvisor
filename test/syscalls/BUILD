@@ -1268,3 +1268,8 @@ syscall_test(
     save = False,
     test = "//test/syscalls/linux:socketopt_test",
 )
+
+syscall_test(
+    save = False,
+    test = "//test/syscalls/linux:packet_mmap_test",
+)

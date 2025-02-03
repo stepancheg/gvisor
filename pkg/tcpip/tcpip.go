@@ -996,6 +996,13 @@ const (
 	// IPv6Checksum is used to request the stack to populate and validate the IPv6
 	// checksum for transport level headers.
 	IPv6Checksum
+
+	// PacketMMapVersionOption is used to set the packet mmap version.
+	PacketMMapVersionOption
+
+	// PacketMMapReserveOption is used to set the packet mmap reserved space
+	// between the aligned header and the payload.
+	PacketMMapReserveOption
 )
 
 const (
@@ -1197,6 +1204,17 @@ type TpacketReq struct {
 }
 
 func (*TpacketReq) isSettableSocketOption() {}
+
+// TpacketStats is the statistics for a packet_mmap ring buffer from
+// <linux/if_packet.h>.
+//
+// +stateify savable
+type TpacketStats struct {
+	Packets uint32
+	Dropped uint32
+}
+
+func (*TpacketStats) isGettableSocketOption() {}
 
 // EndpointState represents the state of an endpoint.
 type EndpointState uint8

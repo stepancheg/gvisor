@@ -339,6 +339,31 @@ func TestStdio(t *testing.T) {
 	}
 }
 
+func TestTcpdump(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainerWithRuntime(ctx, t, "-docker")
+	defer d.CleanUp(ctx)
+
+	cmd := "tcpdump -c 2 -i lo port 9999"
+	if err := d.Spawn(ctx, dockerutil.RunOpts{
+		Image: "basic/tcpdump",
+	}, "/bin/sh", "-c", cmd); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	cmd = "python3 sender.py"
+	if _, err := d.Exec(ctx, dockerutil.ExecOpts{}, "/bin/sh", "-c", cmd); err != nil {
+		t.Fatalf("docker exec failed: %v", err)
+	}
+	expectedOutputStr1 := "IP localhost.9999 > localhost.9999: UDP, length 4"
+	if _, err := d.WaitForOutput(ctx, expectedOutputStr1, defaultWait); err != nil {
+		t.Fatalf("docker didn't get output: %q, got: %q", expectedOutputStr1, err)
+	}
+	expectedOutputStr2 := "IP localhost.9999 > localhost.9999: UDP, length 8"
+	if _, err := d.WaitForOutput(ctx, expectedOutputStr2, defaultWait); err != nil {
+		t.Fatalf("docker didn't get output: %q, got: %q", expectedOutputStr2, err)
+	}
+}
+
 func dockerInGvisorCapabilities() []string {
 	return []string{
 		"audit_write",

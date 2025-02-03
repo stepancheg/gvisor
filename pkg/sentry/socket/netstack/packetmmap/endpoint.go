@@ -64,12 +64,16 @@ type Endpoint struct {
 	cooked    bool
 	packetEP  stack.MappablePacketEndpoint
 	mode      ringBufferMode
+	reserve   uint32
 	nicID     tcpip.NICID
 	netProto  tcpip.NetworkProtocolNumber
+	version   int
 	headerLen uint32
 
+	received atomicbitops.Uint32
+	dropped  atomicbitops.Uint32
+
 	stack *stack.Stack
-	stats *tcpip.TransportEndpointStats
 	wq    *waiter.Queue
 
 	mappingsMu sync.Mutex `state:"nosave"`
@@ -85,10 +89,20 @@ func (m *Endpoint) Init(ctx context.Context, opts stack.PacketMMapOpts) error {
 	m.wq = opts.Wq
 	m.cooked = opts.Cooked
 	m.packetEP = opts.PacketEndpoint
-	m.stats = opts.Stats
 	m.nicID = opts.NICID
 	m.netProto = opts.NetProto
-	m.headerLen = linux.TPACKET_HDRLEN
+	m.version = opts.Version
+	m.reserve = opts.Reserve
+	m.nicID = opts.NICID
+	m.netProto = opts.NetProto
+	switch m.version {
+	case linux.TPACKET_V1:
+		m.headerLen = linux.TPACKET_HDRLEN
+	case linux.TPACKET_V2:
+		m.headerLen = linux.TPACKET2_HDRLEN
+	default:
+		panic(fmt.Sprintf("invalid version %d supplied to InitPacketMMap", m.version))
+	}
 	if opts.Req.TpBlockNr != 0 {
 		if opts.Req.TpBlockSize <= 0 {
 			return linuxerr.EINVAL
@@ -96,7 +110,7 @@ func (m *Endpoint) Init(ctx context.Context, opts stack.PacketMMapOpts) error {
 		if opts.Req.TpBlockSize%hostarch.PageSize != 0 {
 			return linuxerr.EINVAL
 		}
-		if opts.Req.TpFrameSize < m.headerLen {
+		if opts.Req.TpFrameSize < m.headerLen+m.reserve {
 			return linuxerr.EINVAL
 		}
 		if opts.Req.TpFrameSize&(linux.TPACKET_ALIGNMENT-1) != 0 {
@@ -172,6 +186,7 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	if !m.rxRingBuffer.hasRoom() {
 		m.mu.Unlock()
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
 	m.mu.Unlock()
@@ -188,14 +203,14 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 		pktBuf.TrimFront(int64(len(pkt.LinkHeader().Slice()) + len(pkt.VirtioNetHeader().Slice())))
 		// Cooked packet endpoints don't include the link-headers in received
 		// packets.
-		netOffset = linux.TPacketAlign(m.headerLen + minMacLen)
+		netOffset = linux.TPacketAlign(m.headerLen+minMacLen) + m.reserve
 		macOffset = netOffset
 	} else {
 		virtioNetHdrLen := uint32(len(pkt.VirtioNetHeader().Slice()))
 		macLen := uint32(len(pkt.LinkHeader().Slice())) + virtioNetHdrLen
-		netOffset = linux.TPacketAlign(m.headerLen + macLen)
+		netOffset = linux.TPacketAlign(m.headerLen+macLen) + m.reserve
 		if macLen < minMacLen {
-			netOffset = linux.TPacketAlign(m.headerLen + minMacLen)
+			netOffset = linux.TPacketAlign(m.headerLen+minMacLen) + m.reserve
 		}
 		if virtioNetHdrLen > 0 {
 			netOffset += virtioNetHdrLen
@@ -204,6 +219,7 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	}
 	if netOffset > uint32(^uint16(0)) {
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
 	dataLength = uint32(pktBuf.Size())
@@ -224,6 +240,7 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	if err != nil || tpStatus != linux.TP_STATUS_KERNEL {
 		m.mu.Unlock()
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
 
@@ -231,6 +248,7 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	if !ok {
 		m.mu.Unlock()
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
 	m.rxRingBuffer.incHead()
@@ -250,6 +268,7 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 
 	if err := m.rxRingBuffer.writeFrame(slot, hdrView, pktBuf); err != nil {
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
 
@@ -257,9 +276,10 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	defer m.mu.Unlock()
 	if err := m.rxRingBuffer.writeStatus(slot, status); err != nil {
 		m.stack.Stats().DroppedPackets.Increment()
+		m.dropped.Add(1)
 		return
 	}
-	m.stats.PacketsReceived.Increment()
+	m.received.Add(1)
 	m.wq.Notify(waiter.ReadableEvents)
 }
 
@@ -349,6 +369,16 @@ func (m *Endpoint) Mapped() bool {
 	return m.mapped.Load() != 0
 }
 
+// Stats implements stack.PacketMMapEndpoint.Stats.
+func (m *Endpoint) Stats() tcpip.TpacketStats {
+	rcv := m.received.Swap(0)
+	drop := m.dropped.Swap(0)
+	return tcpip.TpacketStats{
+		Packets: uint32(rcv + drop),
+		Dropped: uint32(drop),
+	}
+}
+
 func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 	switch pktType {
 	case tcpip.PacketHost:
@@ -378,22 +408,43 @@ func (m *Endpoint) marshalSockAddr(pkt *stack.PacketBuffer, view *buffer.View) {
 		hdr := header.Ethernet(pkt.LinkHeader().Slice())
 		copy(sll.HardwareAddr[:], hdr.SourceAddress())
 	}
-	hdrSize := uint32((*linux.TpacketHdr)(nil).SizeBytes())
+	var hdrSize uint32
+	if m.version == linux.TPACKET_V2 {
+		hdrSize = uint32((*linux.Tpacket2Hdr)(nil).SizeBytes())
+	} else {
+		hdrSize = uint32((*linux.TpacketHdr)(nil).SizeBytes())
+	}
 	sll.MarshalBytes(view.AsSlice()[linux.TPacketAlign(hdrSize):])
 }
 
 func (m *Endpoint) marshalFrameHeader(pktBuf buffer.Buffer, macOffset, netOffset, dataLength uint32, view *buffer.View) {
 	t := m.stack.Clock().Now()
-	hdr := linux.TpacketHdr{
-		// The status is set separately to ensure the frame is written before the
-		// status is set.
-		TpStatus:  linux.TP_STATUS_KERNEL,
-		TpLen:     uint32(pktBuf.Size()),
-		TpSnaplen: dataLength,
-		TpMac:     uint16(macOffset),
-		TpNet:     uint16(netOffset),
-		TpSec:     uint32(t.Unix()),
-		TpUsec:    uint32(t.UnixMicro() % 1e6),
+	switch m.version {
+	case linux.TPACKET_V1:
+		hdr := linux.TpacketHdr{
+			// The status is set separately to ensure the frame is written before the
+			// status is set.
+			TpStatus:  linux.TP_STATUS_KERNEL,
+			TpLen:     uint32(pktBuf.Size()),
+			TpSnaplen: dataLength,
+			TpMac:     uint16(macOffset),
+			TpNet:     uint16(netOffset),
+			TpSec:     uint32(t.Unix()),
+			TpUsec:    uint32(t.UnixMicro() % 1e6),
+		}
+		hdr.MarshalBytes(view.AsSlice())
+	case linux.TPACKET_V2:
+		hdr := linux.Tpacket2Hdr{
+			TpStatus:  linux.TP_STATUS_KERNEL,
+			TpLen:     uint32(pktBuf.Size()),
+			TpSnaplen: dataLength,
+			TpMac:     uint16(macOffset),
+			TpNet:     uint16(netOffset),
+			TpSec:     uint32(t.Unix()),
+			TpNSec:    uint32(t.UnixNano() % 1e9),
+		}
+		hdr.MarshalBytes(view.AsSlice())
+	default:
+		panic(fmt.Sprintf("invalid version %d supplied to HandlePacket", m.version))
 	}
-	hdr.MarshalBytes(view.AsSlice())
 }

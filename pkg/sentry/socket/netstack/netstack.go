@@ -51,9 +51,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	epb "gvisor.dev/gvisor/pkg/sentry/socket/netstack/events_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack/packetmmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -905,9 +907,9 @@ func GetSockOpt(t *kernel.Task, s socket.Socket, ep commonEndpoint, family int, 
 	case linux.SOL_ICMPV6:
 		return getSockOptICMPv6(t, s, ep, name, outLen)
 
-	case linux.SOL_UDP,
-		linux.SOL_RAW,
-		linux.SOL_PACKET:
+	case linux.SOL_PACKET:
+		return getSockOptPacket(t, s, ep, name, outPtr, outLen)
+	case linux.SOL_UDP, linux.SOL_RAW:
 		// Not supported.
 	}
 
@@ -1848,6 +1850,39 @@ func getSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
+func getSockOptPacket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+	if _, ok := ep.(tcpip.Endpoint); !ok {
+		log.Warningf("SOL_PACKET options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
+		return nil, syserr.ErrUnknownProtocolOption
+	}
+	switch name {
+	case linux.PACKET_HDRLEN:
+		var version primitive.Int32
+		version.CopyIn(t, outPtr)
+		switch version {
+		case linux.TPACKET_V1:
+			v := primitive.Int32(uint32((*linux.TpacketHdr)(nil).SizeBytes()))
+			return &v, nil
+		case linux.TPACKET_V2:
+			v := primitive.Int32(uint32((*linux.Tpacket2Hdr)(nil).SizeBytes()))
+			return &v, nil
+		default:
+			return nil, syserr.ErrInvalidArgument
+		}
+	case linux.PACKET_STATISTICS:
+		var tps tcpip.TpacketStats
+		if err := ep.GetSockOpt(&tps); err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+		v := linux.TpacketStats{
+			Packets: tps.Packets,
+			Dropped: tps.Dropped,
+		}
+		return &v, nil
+	}
+	return nil, syserr.ErrProtocolNotAvailable
+}
+
 // SetSockOpt can be used to implement the linux syscall setsockopt(2) for
 // sockets backed by a commonEndpoint.
 func SetSockOpt(t *kernel.Task, s socket.Socket, ep commonEndpoint, level int, name int, optVal []byte) *syserr.Error {
@@ -1868,10 +1903,7 @@ func SetSockOpt(t *kernel.Task, s socket.Socket, ep commonEndpoint, level int, n
 		return setSockOptIP(t, s, ep, name, optVal)
 
 	case linux.SOL_PACKET:
-		// gVisor doesn't support any SOL_PACKET options just return not
-		// supported. Returning nil here will result in tcpdump thinking AF_PACKET
-		// features are supported and proceed to use them and break.
-		return syserr.ErrProtocolNotAvailable
+		return setSockOptPacket(t, s, ep, name, optVal)
 
 	case linux.SOL_UDP,
 		linux.SOL_RAW:
@@ -2718,6 +2750,53 @@ func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 	return nil
 }
 
+func setSockOptPacket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+	switch name {
+	case linux.PACKET_RX_RING:
+		var tpacketReq linux.TpacketReq
+		tpacketReq.UnmarshalBytes(optVal)
+		req := tcpip.TpacketReq{
+			TpBlockSize: tpacketReq.TpBlockSize,
+			TpBlockNr:   tpacketReq.TpBlockNr,
+			TpFrameSize: tpacketReq.TpFrameSize,
+			TpFrameNr:   tpacketReq.TpFrameNr,
+		}
+		if err := ep.SetSockOpt(&req); err != nil {
+			return syserr.TranslateNetstackError(err)
+		}
+		if ep, ok := ep.(stack.MappablePacketEndpoint); ok {
+			var pme *packetmmap.Endpoint
+			if ep.GetPacketMMapEndpoint() != nil {
+				pme = ep.GetPacketMMapEndpoint().(*packetmmap.Endpoint)
+				if pme.Mapped() {
+					return syserr.ErrBusy
+				}
+			} else {
+				pme = &packetmmap.Endpoint{}
+			}
+			opts := ep.GetPacketMMapOpts(&req, true /* isRx */)
+			if err := pme.Init(t, opts); err != nil {
+				return syserr.FromError(err)
+			}
+			ep.SetPacketMMapEndpoint(pme)
+		} else {
+			return syserr.ErrNotSupported
+		}
+		return nil
+	case linux.PACKET_VERSION:
+		v := hostarch.ByteOrder.Uint32(optVal)
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.PacketMMapVersionOption, int(v)))
+	case linux.PACKET_RESERVE:
+		v := hostarch.ByteOrder.Uint32(optVal)
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.PacketMMapReserveOption, int(v)))
+	case linux.PACKET_ADD_MEMBERSHIP, linux.PACKET_AUXDATA:
+		// Silently ignore these options.
+		return nil
+	default:
+		return syserr.ErrNotSupported
+	}
+}
+
 // GetSockName implements the linux syscall getsockname(2) for sockets backed by
 // tcpip.Endpoint.
 func (s *sock) GetSockName(*kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
@@ -3542,4 +3621,20 @@ func (s *sock) EventRegister(e *waiter.Entry) error {
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (s *sock) EventUnregister(e *waiter.Entry) {
 	s.Queue.EventUnregister(e)
+}
+
+// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
+func (s *sock) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+	if mappablePacketEP, ok := s.Endpoint.(stack.MappablePacketEndpoint); ok {
+		packetMMapEP := mappablePacketEP.GetPacketMMapEndpoint()
+		if packetMMapEP == nil {
+			return linuxerr.ENODEV
+		}
+		ep := packetMMapEP.(*packetmmap.Endpoint)
+		if err := vfs.GenericConfigureMMap(&s.vfsfd, ep, opts); err != nil {
+			return err
+		}
+		return ep.ConfigureMMap(ctx, opts)
+	}
+	return linuxerr.ENODEV
 }
