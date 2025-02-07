@@ -349,6 +349,8 @@ func (cc *taskCopyContext) CopyScratchBuffer(size int) []byte {
 }
 
 func (cc *taskCopyContext) getMemoryManager() (*mm.MemoryManager, error) {
+	cc.t.mu.Lock()
+	defer cc.t.mu.Unlock()
 	tmm := cc.t.MemoryManager()
 	if tmm == nil {
 		return nil, linuxerr.ESRCH
@@ -362,7 +364,6 @@ func (cc *taskCopyContext) getMemoryManager() (*mm.MemoryManager, error) {
 // CopyInBytes implements marshal.CopyContext.CopyInBytes.
 //
 // Preconditions: Same as usermem.IO.CopyIn, plus:
-//   - The caller must be running on the task goroutine or hold the cc.t.mu
 //   - t's AddressSpace must be active.
 func (cc *taskCopyContext) CopyInBytes(addr hostarch.Addr, dst []byte) (int, error) {
 	tmm, err := cc.getMemoryManager()
@@ -376,7 +377,6 @@ func (cc *taskCopyContext) CopyInBytes(addr hostarch.Addr, dst []byte) (int, err
 // CopyOutBytes implements marshal.CopyContext.CopyOutBytes.
 //
 // Preconditions: Same as usermem.IO.CopyOut, plus:
-//   - The caller must be running on the task goroutine or hold the cc.t.mu
 //   - t's AddressSpace must be active.
 func (cc *taskCopyContext) CopyOutBytes(addr hostarch.Addr, src []byte) (int, error) {
 	tmm, err := cc.getMemoryManager()
